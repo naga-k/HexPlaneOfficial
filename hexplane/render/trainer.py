@@ -42,6 +42,8 @@ class Trainer:
         summary_writer,
         logfolder,
         device,
+        optimizer,
+        aux_optimizer=None
     ):
         self.model = model
         self.cfg = cfg
@@ -51,6 +53,8 @@ class Trainer:
         self.summary_writer = summary_writer
         self.logfolder = logfolder
         self.device = device
+        self.optimizer = optimizer
+        self.aux_optimizer = aux_optimizer
 
     def get_lr_decay_factor(self, step):
         """
@@ -397,9 +401,27 @@ class Trainer:
                     "train/dist_loss", dist_loss.detach().item(), global_step=iteration
                 )
 
+            # Add compression losses if enabled
+            if self.model.use_codec and iteration >= self.cfg.model.compression.codec_warmup:
+                # Encode-decode step
+                self.model.encode_decode_app()
+                total_loss += self.cfg.model.compression.app_rate_weight * self.model.app_rate
+                
+                # Add regularization loss if specified
+                if self.cfg.model.compression.app_reg_weight > 0:
+                    reg_loss = self.model.get_reg_loss()
+                    total_loss += self.cfg.model.compression.app_reg_weight * reg_loss
+
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+
+            # Auxiliary optimization step for codec
+            if self.model.use_codec and iteration >= self.cfg.model.compression.codec_warmup:
+                aux_loss = self.model.get_aux_loss()
+                self.aux_optimizer.zero_grad()
+                aux_loss.backward()
+                self.aux_optimizer.step()
 
             loss = loss.detach().item()
             PSNRs.append(-10.0 * np.log(loss) / np.log(10.0))
@@ -471,3 +493,9 @@ class Trainer:
                 optimizer = torch.optim.Adam(
                     grad_vars, betas=(self.cfg.optim.beta1, self.cfg.optim.beta2)
                 )
+
+        # After training loop, update codec
+        if self.model.use_codec:
+            self.model.update_codec()
+
+        return

@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 
 @dataclass
@@ -10,6 +10,19 @@ class System_Config:
     progress_refresh_rate: int = 10
     vis_every: int = 10000
     add_timestamp: bool = True
+
+
+@dataclass
+class CompressionConfig:
+    enable: bool = True
+    type: str = "elic"
+    latent_dim: int = 128
+    lr_codec_net: float = 1e-4
+    lr_codec_aux: float = 1e-3
+    app_rate_weight: float = 1e-5
+    app_reg_weight: float = 0.0
+    codec_warmup: int = 10000
+    parameters: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -87,6 +100,8 @@ class Model_Config:
     # using "unaligned" upsampling will essentially double the grid sizes at each time, ignoring N_voxel_final.
     upsampling_type: str = "aligned"  # choose from "aligned", "unaligned".
     nSamples: int = 1000000
+
+    compression: CompressionConfig = CompressionConfig()
 
 
 @dataclass

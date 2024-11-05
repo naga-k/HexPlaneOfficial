@@ -1,16 +1,87 @@
 import torch
-from torch.nn import functional as F
-
+import torch.nn.functional as F
+from compressai.zoo import bmshj2018_factorized, mbt2018_mean
+from compressai.models import CompressionModel
 from hexplane.model.HexPlane_Base import HexPlane_Base
+from typing import List, Tuple
+import math
 
 
 class HexPlane(HexPlane_Base):
     """
     A general version of HexPlane, which supports different fusion methods and feature regressor methods.
     """
-
     def __init__(self, aabb, gridSize, device, time_grid, near_far, **kargs):
         super().__init__(aabb, gridSize, device, time_grid, near_far, **kargs)
+        self.use_codec = kargs.get('compression_enable', False)
+        self.device = device
+
+        if self.use_codec:
+            self.init_codec()
+
+    def init_codec(self):
+        self.net_name = "mbt2018"
+        self.app_feat = sum(self.app_n_comp)
+        self.num_planes = len(self.app_plane)
+        self.codec_block_size = 16
+
+        # Initialize MBT2018 codec
+        self.app_nets = torch.nn.ModuleList()
+        for _ in range(self.num_planes):
+            codec_net = mbt2018_mean(quality=2, pretrained=True)
+            # Modify input channels if necessary
+            # Assuming `update_input_channel` is a method you've defined
+            # codec_net.update_input_channel(self.app_feat)
+            self.app_nets.append(codec_net.to(self.device))
+
+    def _pad(self, tensor):
+        _, _, h, w = tensor.size()
+        block_size = self.codec_block_size
+
+        pad_h = (block_size - h % block_size) % block_size
+        pad_w = (block_size - w % block_size) % block_size
+
+        padding = (0, pad_w, 0, pad_h)  # (left, right, top, bottom)
+        padded_tensor = F.pad(tensor, padding, mode='constant', value=0)
+        return padded_tensor, padding
+
+    def _unpad(self, tensor, padding):
+        _, _, h, w = tensor.size()
+        pad_top, pad_bottom, pad_left, pad_right = padding[2], padding[3], padding[0], padding[1]
+        unpadded_tensor = tensor[:, :, pad_top:h - pad_bottom, pad_left:w - pad_right]
+        return unpadded_tensor
+
+    def encode_decode_app(self):
+        out_planes = []
+        out_rate = 0
+
+        for idx in range(self.num_planes):
+            # Implement compression logic
+            compressed_plane = self.app_nets[idx](self.app_plane[idx])
+            out_planes.append(compressed_plane)
+            out_rate += self._estimate_rate(compressed_plane)
+
+        self.app_plane = torch.nn.ParameterList(out_planes)
+        self.app_rate = out_rate
+
+        return {
+            "app_plane": self.app_plane.state_dict(),
+            "app_rate": self.app_rate.item(),
+        }
+
+    def _estimate_rate(self, output):
+        num_pixels = output["x_hat"].numel() / output["x_hat"].shape[1]  # Assuming batch size is 1
+        rate = torch.zeros(1, device=self.device)
+        for likelihoods in output["likelihoods"].values():
+            rate += torch.sum(-torch.log2(likelihoods)) / num_pixels
+        return rate
+
+    def _measure_size(self, compressed):
+        size = 0
+        for s in compressed["strings"]:
+            for string in s:
+                size += len(string)
+        return size
 
     def init_planes(self, res, device):
         """
@@ -141,7 +212,38 @@ class HexPlane(HexPlane_Base):
                 }
             ]
 
+        if self.use_codec:
+            for idx in range(self.num_planes):
+                codec_params = self._get_codec_params(self.app_nets[idx])
+                grad_vars.append(
+                    {
+                        "params": codec_params['net'],
+                        "lr": lr_scale * cfg.lr_codec_net,
+                        "lr_org": cfg.lr_codec_net,
+                    }
+                )
+                grad_vars.append(
+                    {
+                        "params": codec_params['aux'],
+                        "lr": lr_scale * cfg.lr_codec_aux,
+                        "lr_org": cfg.lr_codec_aux,
+                    }
+                )
+
         return grad_vars
+
+    def _get_codec_params(self, net):
+        params = {
+            'net': [],
+            'aux': []
+        }
+        for name, param in net.named_parameters():
+            if param.requires_grad:
+                if name.endswith('.quantiles'):
+                    params['aux'].append(param)
+                else:
+                    params['net'].append(param)
+        return params['net'], params['aux']
 
     def compute_densityfeature(
         self, xyz_sampled: torch.Tensor, frame_time: torch.Tensor
@@ -394,3 +496,31 @@ class HexPlane(HexPlane_Base):
 
         self.update_stepSize(res_target)
         print(f"upsamping to {res_target}")
+
+    def save_compressed(self, save_path):
+        """
+        Compresses the model parameters and saves the compressed data.
+
+        Args:
+            save_path (str): Path to save the compressed file.
+        """
+        compressed_data = {
+            "app_plane": {name: param.cpu() for name, param in self.app_plane.named_parameters()},
+            "app_rate": self.app_rate if hasattr(self, 'app_rate') else None,
+            # Add other compressed components if necessary
+        }
+        torch.save(compressed_data, save_path)
+
+    def load_compressed(self, compressed_path, device):
+        """
+        Loads the compressed data into the model.
+
+        Args:
+            compressed_path (str): Path to the compressed file.
+            device (torch.device): Device to load the parameters on.
+        """
+        compressed_data = torch.load(compressed_path, map_location=device)
+        self.app_plane.load_state_dict(compressed_data["app_plane"])
+        if "app_rate" in compressed_data and compressed_data["app_rate"] is not None:
+            self.app_rate = compressed_data["app_rate"]
+        # Load other compressed components if necessary
